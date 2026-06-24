@@ -1,47 +1,70 @@
-const data = require('../data/seed');
+const pool = require('../config/database');
 
-const getSlots = (req, res) => {
-  const total = data.parkingSlots.length;
-  const occupied = data.parkingSlots.filter(s => s.status === 'occupied').length;
-  const available = total - occupied;
+const getSlots = async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM parking_slots ORDER BY id');
+    const slots = result.rows;
+    
+    const total = slots.length;
+    const occupied = slots.filter(s => s.status === 'occupied').length;
+    const available = total - occupied;
 
-  res.json({
-    slots: data.parkingSlots,
-    stats: {
-      total,
-      available,
-      occupied,
-      occupancyRate: Math.round((occupied / total) * 100)
-    }
-  });
+    res.json({
+      slots,
+      stats: {
+        total,
+        available,
+        occupied,
+        occupancyRate: total > 0 ? Math.round((occupied / total) * 100) : 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error fetching parking slots.' });
+  }
 };
 
-const reserveSlot = (req, res) => {
+const reserveSlot = async (req, res) => {
   const { slotId, vehiclePlate } = req.body;
   const userId = req.user.id;
 
-  const slot = data.parkingSlots.find(s => s.id === parseInt(slotId));
-  if (!slot) return res.status(404).json({ error: 'Parking slot not found.' });
-  if (slot.status === 'occupied') return res.status(400).json({ error: 'Slot is already occupied.' });
+  try {
+    const slotRes = await pool.query('SELECT * FROM parking_slots WHERE id = $1', [slotId]);
+    if (slotRes.rows.length === 0) return res.status(404).json({ error: 'Parking slot not found.' });
+    
+    const slot = slotRes.rows[0];
+    if (slot.status === 'occupied') return res.status(400).json({ error: 'Slot is already occupied.' });
 
-  slot.status = 'occupied';
-  slot.reservedBy = userId;
-  slot.vehiclePlate = vehiclePlate || null;
-  slot.reservedAt = new Date().toISOString();
+    const updateRes = await pool.query(
+      `UPDATE parking_slots 
+       SET status = 'occupied', reserved_by = $1, vehicle_plate = $2, reserved_at = CURRENT_TIMESTAMP
+       WHERE id = $3 RETURNING *`,
+      [userId, vehiclePlate || null, slotId]
+    );
 
-  res.json({ slot, message: `Slot #${slot.slotNumber} reserved successfully!` });
+    const updatedSlot = updateRes.rows[0];
+    res.json({ slot: updatedSlot, message: `Slot #${updatedSlot.slot_number} reserved successfully!` });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error reserving slot.' });
+  }
 };
 
-const releaseSlot = (req, res) => {
-  const slot = data.parkingSlots.find(s => s.id === parseInt(req.params.id));
-  if (!slot) return res.status(404).json({ error: 'Parking slot not found.' });
+const releaseSlot = async (req, res) => {
+  try {
+    const slotRes = await pool.query('SELECT * FROM parking_slots WHERE id = $1', [req.params.id]);
+    if (slotRes.rows.length === 0) return res.status(404).json({ error: 'Parking slot not found.' });
 
-  slot.status = 'available';
-  slot.reservedBy = null;
-  slot.vehiclePlate = null;
-  slot.reservedAt = null;
+    const updateRes = await pool.query(
+      `UPDATE parking_slots 
+       SET status = 'available', reserved_by = NULL, vehicle_plate = NULL, reserved_at = NULL
+       WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    );
 
-  res.json({ slot, message: `Slot #${slot.slotNumber} released successfully!` });
+    const updatedSlot = updateRes.rows[0];
+    res.json({ slot: updatedSlot, message: `Slot #${updatedSlot.slot_number} released successfully!` });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error releasing slot.' });
+  }
 };
 
 module.exports = { getSlots, reserveSlot, releaseSlot };

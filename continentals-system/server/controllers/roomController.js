@@ -1,70 +1,127 @@
-const data = require('../data/seed');
+const pool = require('../config/database');
 
-let nextBookingId = data.bookings.length + 1;
+const getPricingConfigAndOverrides = async () => {
+  const configRes = await pool.query('SELECT * FROM pricing_config LIMIT 1');
+  const overridesRes = await pool.query('SELECT * FROM pricing_overrides');
+  
+  const config = configRes.rows[0] || { enabled: true, thresholds: [] };
+  const overrides = {};
+  overridesRes.rows.forEach(row => {
+    overrides[row.room_type] = row.price;
+  });
+  
+  return { config, overrides };
+};
 
-// Calculate dynamic pricing based on occupancy
-const calculateDynamicPrice = (room) => {
-  if (!data.pricingConfig.enabled) return room.basePrice;
+const calculateDynamicPrice = async (room, config, overrides, occupancyRate) => {
+  if (!config.enabled) return room.base_price;
 
-  // Check for manual override
-  const override = data.pricingOverrides[room.type] || data.pricingOverrides[room.id];
+  const override = overrides[room.type] || overrides[room.id];
   if (override) return override;
 
-  const totalRooms = data.rooms.length;
-  const bookedRooms = data.rooms.filter(r => r.status === 'booked').length;
-  const occupancyRate = (bookedRooms / totalRooms) * 100;
-
   let multiplier = 1;
-  for (const threshold of data.pricingConfig.thresholds) {
-    if (occupancyRate >= threshold.occupancy) {
-      multiplier = threshold.multiplier;
-      break;
+  const thresholds = typeof config.thresholds === 'string' ? JSON.parse(config.thresholds) : config.thresholds;
+  
+  if (thresholds && Array.isArray(thresholds)) {
+    for (const threshold of thresholds) {
+      if (occupancyRate >= threshold.occupancy) {
+        multiplier = threshold.multiplier;
+        break;
+      }
     }
   }
 
-  return Math.round(room.basePrice * multiplier);
+  return Math.round(room.base_price * multiplier);
 };
 
-const getRooms = (req, res) => {
-  const { type, checkIn, checkOut, guests } = req.query;
+const getRooms = async (req, res) => {
+  const { type, guests } = req.query;
 
-  let filtered = data.rooms.map(room => ({
-    ...room,
-    currentPrice: calculateDynamicPrice(room)
-  }));
+  try {
+    let query = 'SELECT * FROM rooms';
+    const params = [];
+    let conditions = [];
 
-  if (type && type !== 'all') {
-    filtered = filtered.filter(r => r.type === type);
-  }
-
-  if (guests) {
-    filtered = filtered.filter(r => r.capacity >= parseInt(guests));
-  }
-
-  // Occupancy stats
-  const totalRooms = data.rooms.length;
-  const bookedRooms = data.rooms.filter(r => r.status === 'booked').length;
-  const occupancyRate = Math.round((bookedRooms / totalRooms) * 100);
-
-  res.json({
-    rooms: filtered,
-    stats: {
-      total: totalRooms,
-      available: totalRooms - bookedRooms,
-      booked: bookedRooms,
-      occupancyRate
+    if (type && type !== 'all') {
+      params.push(type);
+      conditions.push(`type = $${params.length}`);
     }
-  });
+
+    if (guests) {
+      params.push(parseInt(guests));
+      conditions.push(`capacity >= $${params.length}`);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ` + conditions.join(' AND ');
+    }
+
+    query += ' ORDER BY id';
+
+    const [roomsRes, statsRes, pricingData] = await Promise.all([
+      pool.query(query, params),
+      pool.query(`
+        SELECT 
+          COUNT(*) as total,
+          SUM(CASE WHEN status = 'booked' THEN 1 ELSE 0 END) as booked
+        FROM rooms
+      `),
+      getPricingConfigAndOverrides()
+    ]);
+
+    const stats = statsRes.rows[0];
+    const totalRooms = parseInt(stats.total) || 0;
+    const bookedRooms = parseInt(stats.booked) || 0;
+    const occupancyRate = totalRooms > 0 ? Math.round((bookedRooms / totalRooms) * 100) : 0;
+
+    const roomsWithPrices = await Promise.all(roomsRes.rows.map(async room => ({
+      ...room,
+      basePrice: room.base_price,
+      currentPrice: await calculateDynamicPrice(room, pricingData.config, pricingData.overrides, occupancyRate)
+    })));
+
+    res.json({
+      rooms: roomsWithPrices,
+      stats: {
+        total: totalRooms,
+        available: totalRooms - bookedRooms,
+        booked: bookedRooms,
+        occupancyRate
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error fetching rooms.' });
+  }
 };
 
-const getRoomById = (req, res) => {
-  const room = data.rooms.find(r => r.id === parseInt(req.params.id));
-  if (!room) return res.status(404).json({ error: 'Room not found.' });
+const getRoomById = async (req, res) => {
+  try {
+    const roomRes = await pool.query('SELECT * FROM rooms WHERE id = $1', [req.params.id]);
+    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Room not found.' });
 
-  res.json({ ...room, currentPrice: calculateDynamicPrice(room) });
+    const statsRes = await pool.query(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'booked' THEN 1 ELSE 0 END) as booked
+      FROM rooms
+    `);
+    const stats = statsRes.rows[0];
+    const occupancyRate = stats.total > 0 ? Math.round((stats.booked / stats.total) * 100) : 0;
+
+    const pricingData = await getPricingConfigAndOverrides();
+    const room = roomRes.rows[0];
+    
+    res.json({
+      ...room,
+      basePrice: room.base_price,
+      currentPrice: await calculateDynamicPrice(room, pricingData.config, pricingData.overrides, occupancyRate)
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error fetching room details.' });
+  }
 };
 
-const bookRoom = (req, res) => {
+const bookRoom = async (req, res) => {
   const { roomId, checkIn, checkOut, guests } = req.body;
   const userId = req.user.id;
 
@@ -72,54 +129,75 @@ const bookRoom = (req, res) => {
     return res.status(400).json({ error: 'Room ID, check-in, and check-out dates are required.' });
   }
 
-  const room = data.rooms.find(r => r.id === parseInt(roomId));
-  if (!room) return res.status(404).json({ error: 'Room not found.' });
-  if (room.status === 'booked') return res.status(400).json({ error: 'Room is already booked.' });
+  const client = await pool.connect();
 
-  const nights = Math.ceil((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24));
-  const pricePerNight = calculateDynamicPrice(room);
-  const totalPrice = pricePerNight * nights;
+  try {
+    await client.query('BEGIN');
 
-  room.status = 'booked';
-  room.bookedBy = userId;
-  room.checkIn = checkIn;
-  room.checkOut = checkOut;
+    // Get room with lock
+    const roomRes = await client.query('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
+    if (roomRes.rows.length === 0) throw new Error('Room not found.');
+    
+    const room = roomRes.rows[0];
+    if (room.status === 'booked') throw new Error('Room is already booked.');
 
-  const booking = {
-    id: nextBookingId++,
-    userId,
-    roomId: room.id,
-    roomNumber: room.number,
-    roomType: room.type,
-    roomName: room.name,
-    checkIn,
-    checkOut,
-    guests: guests || 1,
-    nights,
-    pricePerNight,
-    totalPrice,
-    status: 'confirmed',
-    createdAt: new Date().toISOString()
-  };
+    // Calculate dynamic price
+    const statsRes = await client.query(`
+      SELECT COUNT(*) as total, SUM(CASE WHEN status = 'booked' THEN 1 ELSE 0 END) as booked FROM rooms
+    `);
+    const occupancyRate = Math.round((statsRes.rows[0].booked / statsRes.rows[0].total) * 100) || 0;
+    const pricingData = await getPricingConfigAndOverrides();
+    const pricePerNight = await calculateDynamicPrice(room, pricingData.config, pricingData.overrides, occupancyRate);
 
-  data.bookings.push(booking);
+    const nights = Math.max(1, Math.ceil((new Date(checkOut) - new Date(checkIn)) / (1000 * 60 * 60 * 24)));
+    const totalPrice = pricePerNight * nights;
 
-  res.status(201).json({ booking, message: 'Room booked successfully!' });
+    // Update room
+    await client.query(
+      'UPDATE rooms SET status = $1, booked_by = $2, check_in = $3, check_out = $4 WHERE id = $5',
+      ['booked', userId, checkIn, checkOut, roomId]
+    );
+
+    // Create booking
+    const bookingRes = await client.query(
+      `INSERT INTO bookings 
+      (user_id, room_id, room_number, room_type, room_name, check_in, check_out, guests, nights, price_per_night, total_price, status) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [userId, room.id, room.number, room.type, room.name, checkIn, checkOut, guests || 1, nights, pricePerNight, totalPrice, 'confirmed']
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ booking: bookingRes.rows[0], message: 'Room booked successfully!' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: error.message || 'Database error during booking.' });
+  } finally {
+    client.release();
+  }
 };
 
-const updateRoomStatus = (req, res) => {
+const updateRoomStatus = async (req, res) => {
   const { status } = req.body;
-  const room = data.rooms.find(r => r.id === parseInt(req.params.id));
-  if (!room) return res.status(404).json({ error: 'Room not found.' });
+  const roomId = req.params.id;
 
-  room.status = status;
-  if (status === 'available') {
-    room.bookedBy = null;
-    room.checkIn = null;
-    room.checkOut = null;
+  try {
+    const roomRes = await pool.query('SELECT * FROM rooms WHERE id = $1', [roomId]);
+    if (roomRes.rows.length === 0) return res.status(404).json({ error: 'Room not found.' });
+
+    let updateQuery = 'UPDATE rooms SET status = $1';
+    let params = [status, roomId];
+
+    if (status === 'available') {
+      updateQuery += ', booked_by = NULL, check_in = NULL, check_out = NULL';
+    }
+
+    updateQuery += ' WHERE id = $2 RETURNING *';
+
+    const result = await pool.query(updateQuery, params);
+    res.json({ room: result.rows[0], message: 'Room status updated.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Database error updating room status.' });
   }
-
-  res.json({ room, message: 'Room status updated.' });
 };
 
 module.exports = { getRooms, getRoomById, bookRoom, updateRoomStatus, calculateDynamicPrice };
