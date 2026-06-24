@@ -1,4 +1,4 @@
-const API_BASE = '/api';
+const API_BASE = 'https://hotel-backend-uuwd.onrender.com/api';
 
 const getToken = () => localStorage.getItem('continental_token');
 
